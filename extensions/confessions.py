@@ -10,35 +10,25 @@ from __future__ import annotations
 
 import time
 from base64 import b64encode
-from typing import Optional, Union, TYPE_CHECKING
+from typing import Optional, Union, TYPE_CHECKING, cast
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-if TYPE_CHECKING:
-  from main import MerelyBot
-  from babel import Resolvable
-  from configparser import SectionProxy
-
-from overlay.extensions.confessions_common import (
-  Confessable, ChannelType, ChannelSelectView, ConfessionData, NoMemberCacheError, Crypto,
-  get_guildchannels, safe_fetch_target
+from .confessions_common import (
+  ConfessionCog, Confessable, ChannelType, ChannelSelectView, ConfessionData, NoMemberCacheError,
+  Crypto, get_guildchannels, safe_fetch_target
 )
 
+if TYPE_CHECKING:
+  from main import MerelyBot
+  from .confessions_moderation import ConfessionsModeration
 
-class Confessions(commands.Cog):
+
+class Confessions(ConfessionCog):
   """ Facilitates anonymous messaging with moderation on your server """
   SCOPE = 'confessions'
   customcommands: dict[int, str] = {}
-
-  @property
-  def config(self) -> SectionProxy:
-    """ Shorthand for self.bot.config[scope] """
-    return self.bot.config[self.SCOPE]
-
-  def babel(self, target:Resolvable, key:str, **values: dict[str, str | bool]) -> str:
-    """ Shorthand for self.bot.babel(scope, key, **values) """
-    return self.bot.babel(target, self.SCOPE, key, **values)
 
   def __init__(self, bot:MerelyBot):
     self.bot = bot
@@ -69,7 +59,7 @@ class Confessions(commands.Cog):
       if not bot.quiet:
         print(" - WARN: Without `confessions_moderation` enabled, vetting channels won't work")
 
-    self.crypto.key = self.config['secret']
+    self.crypto.setkey(self.config['secret'])
     self.confession_cooldown = dict()
 
     self.confess_reply = app_commands.ContextMenu(
@@ -126,6 +116,7 @@ class Confessions(commands.Cog):
     if message.is_system():
       await inter.response.send_message(self.babel(inter, 'confession_reply_failed'), ephemeral=True)
       return
+    assert isinstance(inter.channel, (discord.TextChannel, discord.Thread))
     data = ConfessionData(self)
     data.create(author=inter.user, target=inter.channel, reference=message)
     await self.verify_and_send(inter, data)
@@ -144,6 +135,7 @@ class Confessions(commands.Cog):
     """
       Send an anonymous message to this channel
     """
+    assert isinstance(inter.channel, (discord.TextChannel, discord.Thread))
     pendingconfession = ConfessionData(self)
     pendingconfession.create(author=inter.user, target=inter.channel)
     pendingconfession.set_content(content)
@@ -156,7 +148,7 @@ class Confessions(commands.Cog):
 
   def generate_list(
     self,
-    user:discord.User,
+    user:discord.User | discord.Member,
     matches:list[tuple[Confessable, ChannelType]],
     vetting:bool
   ) -> str:
@@ -184,6 +176,7 @@ class Confessions(commands.Cog):
     guildchannels = get_guildchannels(self.config, member.guild.id)
     for channel in member.guild.channels:
       if channel.id in guildchannels:
+        assert isinstance(channel, discord.TextChannel)
         channeltype = guildchannels[channel.id]
         if channeltype == ChannelType.vetting:
           vetting = True
@@ -196,10 +189,12 @@ class Confessions(commands.Cog):
           continue
 
     def sort(t:tuple[Confessable, ChannelType]):
-      if isinstance(t[0], discord.TextChannel):
-        return (t[0].category.position if t[0].category else 0, t[0].position)
-      elif isinstance(t[0], discord.Thread):
-        return (t[0].category.position if t[0].category else 0, t[0].parent.position)
+      channel = t[0]
+      if isinstance(channel, discord.TextChannel):
+        return (channel.category.position if channel.category else 0, channel.position)
+      elif isinstance(channel, discord.Thread):
+        assert channel.parent is not None
+        return (channel.category.position if channel.category else 0, channel.parent.position)
       raise Exception("Confessable target was not a TextChannel or a Thread!")
     matches.sort(key=sort)
 
@@ -210,7 +205,7 @@ class Confessions(commands.Cog):
   ) -> list[tuple[Confessable, ChannelType]]:
     """ Scans a channel for any active threads that can be used for confessions """
 
-    matches:list[Confessable] = []
+    matches:list[tuple[Confessable, ChannelType]] = []
     for thread in channel.threads:
       if thread.type != discord.ChannelType.public_thread:
         continue
@@ -245,7 +240,7 @@ class Confessions(commands.Cog):
   async def verify_and_send(
     self,
     inter:discord.Interaction,
-    data:ConfessionData | None = None
+    data:ConfessionData
   ):
     """ Ensure Confession is in a valid state to send and handle all contingencies """
     send = (inter.followup.send if inter.response.is_done() else inter.response.send_message)
@@ -260,7 +255,7 @@ class Confessions(commands.Cog):
         # User chose an invalid channel, give them a chance to choose another
         await send(
           self.babel(inter, 'channelprompt') +
-          (' '+self.babel(inter, 'channelprompt_pager', page=1) if len(matches) > 25 else ''),
+          (' '+self.babel(inter, 'channelprompt_pager', page='1') if len(matches) > 25 else ''),
           view=ChannelSelectView(inter, self, matches, confession=data),
           ephemeral=True
         )
@@ -268,7 +263,8 @@ class Confessions(commands.Cog):
 
       # Check for vetting
       if vettingchannel := await data.check_vetting(inter):
-        await self.bot.cogs['ConfessionsModeration'].send_vetting(inter, data, vettingchannel)
+        moderation = cast("ConfessionsModeration", self.bot.cogs['ConfessionsModeration'])
+        await moderation.send_vetting(inter, data, vettingchannel)
         return
       if vettingchannel is False:
         return
@@ -278,11 +274,11 @@ class Confessions(commands.Cog):
 
     else:
       # User never input any message, give them a paragraph editor
-      await inter.response.send_modal(self.ConfessionModal(self, inter, data))
+      await inter.response.send_modal(self.ComposeModal(self, inter, data))
 
   # Modals
 
-  class ConfessionModal(discord.ui.Modal):
+  class ComposeModal(discord.ui.Modal):
     """ Modal for completing an incomplete confession """
     def __init__(
       self,
@@ -294,6 +290,7 @@ class Confessions(commands.Cog):
         title=parent.babel(origin, 'editor_title'),
         custom_id="confession_modal_"+str(origin.id)
       )
+
       self.content = discord.ui.TextInput(
         label=parent.babel(origin, 'editor_message_label'),
         placeholder=parent.babel(origin, 'editor_message_placeholder'),
@@ -304,13 +301,28 @@ class Confessions(commands.Cog):
       )
       self.add_item(self.content)
 
+      self.image = None
+      if data.attachment is None:
+        self.image = discord.ui.FileUpload(
+          custom_id='image',
+          required=False,
+          max_values=1
+        )
+        self.imageLabel = discord.ui.Label(
+          text="Image (optional)",
+          component=self.image
+        )
+        self.add_item(self.imageLabel)
+
       self.parent = parent
       self.data = data
 
     async def on_submit(self, inter:discord.Interaction):
       """ Send the completed confession """
       self.data.set_content(self.content.value)
-      await self.parent.verify_and_send(inter, data=self.data)
+      if self.image and self.image.values:
+        await self.data.add_image(attachment=self.image.values[0])
+      await self.parent.verify_and_send(inter, self.data)
 
   #	Events
 
@@ -319,8 +331,9 @@ class Confessions(commands.Cog):
     """ Notify users when handling vetting is not possible """
     if inter.type != discord.InteractionType.component:
       return
+    assert inter.data is not None and 'custom_id' in inter.data
     if (
-      inter.data.get('custom_id').startswith('pendingconfession_') and
+      inter.data['custom_id'].startswith('pendingconfession_') and
       'ConfessionsModeration' not in self.bot.cogs
     ):
       await inter.response.send_message(self.babel(inter, 'no_moderation'))
@@ -352,7 +365,7 @@ class Confessions(commands.Cog):
 
       await msg.reply(
         self.babel(msg, 'channelprompt') +
-        (' ' + self.babel(msg, 'channelprompt_pager', page=1) if len(matches) > 25 else ''),
+        (' ' + self.babel(msg, 'channelprompt_pager', page='1') if len(matches) > 25 else ''),
         view=ChannelSelectView(msg, self, matches)
       )
 
@@ -377,6 +390,7 @@ class Confessions(commands.Cog):
     """
       Send an anonymous message to this channel
     """
+    assert isinstance(inter.channel, (discord.TextChannel, discord.Thread))
     pendingconfession = ConfessionData(self)
     pendingconfession.create(author=inter.user, target=inter.channel)
     pendingconfession.set_content(content)
@@ -435,6 +449,7 @@ class Confessions(commands.Cog):
         if isinstance(match[0], discord.TextChannel):
           name = self.bot.utilities.truncate(match[0].name, 40)
         elif isinstance(match[0], discord.Thread):
+          assert match[0].parent is not None
           name = (
             self.bot.utilities.truncate(match[0].parent.name, 20) + '/'
             + self.bot.utilities.truncate(match[0].name, 20)

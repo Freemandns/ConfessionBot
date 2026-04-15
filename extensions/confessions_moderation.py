@@ -6,35 +6,24 @@
 from __future__ import annotations
 
 import asyncio, re
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, cast
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-if TYPE_CHECKING:
-  from main import MerelyBot
-  from babel import Resolvable
-  from configparser import SectionProxy
-  from overlay.extensions.confessions import Confessions
-  from overlay.extensions.confessions_common import Crypto
-
-from overlay.extensions.confessions_common import (
-  ConfessionData, CorruptConfessionDataException, safe_fetch_target
+from extensions.controlpanel import ControlPanelCog, Stringable
+from .confessions_common import (
+  ConfessionCog, ConfessionData, CorruptConfessionDataException, safe_fetch_target
 )
 
+if TYPE_CHECKING:
+  from main import MerelyBot
+  from confessions_common import Crypto
 
-class ConfessionsModeration(commands.Cog):
+
+class ConfessionsModeration(ConfessionCog, ControlPanelCog):
   """ Moderate anonymous messaging on your server """
   SCOPE = 'confessions'
-
-  @property
-  def config(self) -> SectionProxy:
-    """ Shorthand for self.bot.config[scope] """
-    return self.bot.config[self.SCOPE]
-
-  def babel(self, target:Resolvable, key:str, **values: dict[str, str | bool]) -> str:
-    """ Shorthand for self.bot.babel(scope, key, **values) """
-    return self.bot.babel(target, self.SCOPE, key, **values)
 
   @property
   def crypto(self) -> "Crypto":
@@ -42,7 +31,8 @@ class ConfessionsModeration(commands.Cog):
       raise Exception(
         "Module `confessions` was unloaded when it's still required by `confessions_moderation`!"
       )
-    return self.bot.cogs['Confessions'].crypto
+    ext = cast(ConfessionCog, self.bot.cogs['Confessions'])
+    return ext.crypto
 
   def __init__(self, bot:MerelyBot):
     self.bot = bot
@@ -60,6 +50,18 @@ class ConfessionsModeration(commands.Cog):
     )
     bot.tree.add_command(self.report)
 
+  def controlpanel_settings(self, inter:discord.Interaction):
+    # ControlPanel integration
+    if inter.guild and inter.permissions.administrator:
+      return [Stringable(
+        self.SCOPE, f'{inter.guild_id}_badwords', 'bad_words_list_name', r'[\p{L}\d ,\n\-]+(?<![, ])$'
+      )]
+    return []
+
+  def controlpanel_theme(self) -> tuple[str, discord.ButtonStyle]:
+    # Controlpanel custom theme for buttons
+    return (self.SCOPE, discord.ButtonStyle.blurple)
+
   def cog_unload(self):
     self.bot.tree.remove_command(self.report.qualified_name, type=self.report.type)
 
@@ -72,7 +74,7 @@ class ConfessionsModeration(commands.Cog):
       (
         message.author == self.bot.user and
         len(message.embeds) > 0 and
-        message.embeds[0].author is not None and
+        message.embeds[0].author.name is not None and
         message.embeds[0].author.name.startswith('Anon')
       ) or (
         message.application_id == self.bot.application_id and
@@ -170,7 +172,7 @@ class ConfessionsModeration(commands.Cog):
     @discord.ui.button(
       disabled=True, style=discord.ButtonStyle.gray, emoji='➡️', custom_id='confessionreport_confirm'
     )
-    async def report_button(self, inter:discord.Interaction, _:discord.Button):
+    async def report_button(self, inter:discord.Interaction, _:discord.ui.Button):
       """ On click of continue button """
       await inter.response.send_modal(
         self.parent.ReportModal(self.parent, self.message, self.origin)
@@ -189,7 +191,7 @@ class ConfessionsModeration(commands.Cog):
     """ Confirm user input before sending a report """
     def __init__(
         self,
-        parent:"Confessions",
+        parent:ConfessionCog,
         message: discord.Message,
         origin: discord.Interaction
     ):
@@ -215,7 +217,7 @@ class ConfessionsModeration(commands.Cog):
       """ Send report to mod channel as configured """
       if self.parent.config['report_channel']:
         reportchannel = await safe_fetch_target(
-          self.parent, inter, int(self.parent.config.get('report_channel'))
+          self.parent, inter, int(self.parent.config.get('report_channel', fallback=''))
         )
         if reportchannel is None:
           await inter.response.send_message(
@@ -227,11 +229,12 @@ class ConfessionsModeration(commands.Cog):
           embed = self.message.embeds[0]
         else:
           embed = discord.Embed(description=f'**{self.message.author.name}** {self.message.content}')
+        assert inter.guild is not None
         await reportchannel.send(
           self.parent.babel(
             reportchannel.guild, 'new_report',
             server=f'{inter.guild.name} ({inter.guild.id})',
-            user=f'{inter.user.mention} ({inter.user.name}#{inter.user.discriminator})',
+            user=f'{inter.user.mention} ({inter.user.name})',
             reason=self.report_reason.value
           ),
           embed=embed,
@@ -249,7 +252,8 @@ class ConfessionsModeration(commands.Cog):
     """ Handle approving and denying confessions """
     if inter.type != discord.InteractionType.component:
       return
-    custom_id = inter.data.get('custom_id')
+    assert inter.data is not None and 'custom_id' in inter.data
+    custom_id = inter.data['custom_id']
     if not custom_id.startswith('pendingconfession_'):
       return
     if custom_id in self.button_lock:
@@ -258,9 +262,10 @@ class ConfessionsModeration(commands.Cog):
       )
       return
 
-    await inter.response.defer()
     self.button_lock.append(custom_id)
+    await inter.response.defer()
     accepted = False
+    assert inter.message is not None and inter.guild is not None
     try:
       if custom_id.startswith('pendingconfession_approve_'):
         accepted = True
@@ -271,9 +276,10 @@ class ConfessionsModeration(commands.Cog):
           # Try and recover reference if it's lost
           if match := self.jump_url_pattern.search(inter.message.content):
             _, channel_id, message_id = map(int, match.groups())
-            channel = inter.guild.get_channel(channel_id)
+            channel = inter.guild.get_channel_or_thread(channel_id)
+            assert isinstance(channel, (discord.TextChannel, discord.Thread))
             reference = channel.get_partial_message(message_id)
-            pendingconfession.create(reference=reference)
+            pendingconfession.reference = reference
       elif custom_id.startswith('pendingconfession_deny_'):
         pendingconfession = ConfessionData(self)
         await pendingconfession.from_binary(self.crypto, custom_id[23:])
@@ -296,6 +302,7 @@ class ConfessionsModeration(commands.Cog):
           await pendingconfession.add_image(url=inter.message.embeds[0].image.url)
         elif (
           len(inter.message.attachments) and
+          inter.message.attachments[0].content_type is not None and
           inter.message.attachments[0].content_type.startswith('image')
         ):
           await pendingconfession.add_image(attachment=inter.message.attachments[0])
@@ -353,6 +360,7 @@ class ConfessionsModeration(commands.Cog):
     """
       Block or unblock anon-ids from confessing
     """
+    assert inter.guild is not None
     banlist_raw = self.config.get(f'{inter.guild.id}_banned', fallback='')
     banlist = banlist_raw.split(',')
     if anonid is None:

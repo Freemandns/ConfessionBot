@@ -5,28 +5,46 @@
 """
 from __future__ import annotations
 
-import io, re, secrets
+import io, re, secrets, hashlib
 from base64 import b64encode, b64decode
 from Crypto.Cipher import AES
-from Crypto.Hash import SHA
-from typing import Optional, Union, TYPE_CHECKING
+from typing import Optional, Literal, Generator, Any, TYPE_CHECKING, cast
 from collections import OrderedDict
 import discord
 from discord.ext import commands
 import aiohttp
 
+from main import MerelyCog
+
 if TYPE_CHECKING:
   from collections.abc import Mapping
-  from overlay.extensions.confessions import Confessions
-  from overlay.extensions.confessions_moderation import ConfessionsModeration
-  from overlay.extensions.confessions_setup import ConfessionsSetup
   from configparser import SectionProxy
   from babel import Babel, Resolvable
+  from extensions.log import Log
+  from .confessions_moderation import ConfessionsModeration
 
 type Confessable = (discord.TextChannel | discord.Thread)
 
 
 # Data Classes
+
+class ConfessionCog(MerelyCog):
+  crypto: Crypto
+
+  async def on_channeltype_send(
+    self, inter:discord.Interaction, data:ConfessionData
+  ) -> dict[str, Any] | Literal[False]:
+    """
+      Event which can intercept messages with unique channeltypes
+
+      Return a dictionary with the following optional keys to add content to the confession message
+      - use_webhook: Bool
+      - view: discord.ui.View
+
+      Otherwise, you can also return false to prevent the message from being sent
+    """
+    ...
+
 
 class ChannelType:
   """ Anonymous channel types and their properties """
@@ -89,7 +107,7 @@ class ChannelType:
     ChannelType._lookup[value] = self
 
   @classmethod
-  def walk(cls) -> tuple[ChannelType]:
+  def walk(cls) -> Generator[ChannelType]:
     return (c for c in cls._lookup.values())
 
   @classmethod
@@ -114,6 +132,7 @@ class ChannelType:
         elif len(key) == 15 and self.value in range(int(key[-3]), int(key[-1]) + 1):
           name = babel(target, 'confessions', key)
           break
+    assert name is not None
     ext = None
     if long and self.swap:
       if self.anonid:
@@ -189,14 +208,16 @@ def set_guildchannels(config:SectionProxy, guild_id:int, guildchannels:dict[int,
 
 
 async def safe_fetch_target(
-  parent:Confessions | ConfessionsModeration,
+  parent:ConfessionCog,
   inter:discord.Interaction,
   channel_id:int
 ) -> Optional[Confessable]:
   """ Gracefully handles whenever a confession target isn't available """
   try:
-    return await parent.bot.fetch_channel(channel_id)
-  except discord.Forbidden:
+    result = await parent.bot.fetch_channel(channel_id)
+    assert isinstance(result, discord.TextChannel)
+    return result
+  except discord.Forbidden | discord.HTTPException | discord.NotFound:
     await inter.response.send_message(
       parent.babel(inter, 'missingchannelerr') + ' (fetch)',
       ephemeral=True
@@ -225,7 +246,7 @@ class ChannelSelectView(discord.ui.View):
   def __init__(
       self,
       origin:discord.Message | discord.Interaction,
-      parent:Confessions | ConfessionsSetup,
+      parent:ConfessionCog,
       matches:list[tuple[Confessable, ChannelType]],
       confession:ConfessionData | None = None
     ):
@@ -267,7 +288,7 @@ class ChannelSelectView(discord.ui.View):
     self.channel_selector.options = [
       discord.SelectOption(
         label='#' + channel.name + ('' if self.soleguild else f' (from {channel.guild.name})'),
-        value=channel.id,
+        value=str(channel.id),
         emoji=channeltype.icon,
         default=channel.id == self.selection.id if self.selection else False
       ) for channel,channeltype in self.matches[start:start+25]
@@ -276,35 +297,43 @@ class ChannelSelectView(discord.ui.View):
   @discord.ui.select(custom_id='channelselect_selector')
   async def channel_selector(self, inter:discord.Interaction, this:discord.ui.Select):
     """ Update the message to preview the selected target """
-    originuser = (self.origin.author if isinstance(self.origin,discord.Message) else self.origin.user)
+    if isinstance(self.origin, discord.Message):
+      originuser = self.origin.author
+    else:
+      assert isinstance(self.origin, discord.Interaction)
+      originuser = self.origin.user
     if inter.user != originuser:
       await inter.response.send_message(self.parent.bot.babel(inter, 'error', 'wronguser'))
       return
     self.send_button.disabled = False
-    self.selection = self.parent.bot.get_channel(int(this.values[0]))
+    selectedchannel = self.parent.bot.get_channel(int(this.values[0]))
+    assert isinstance(selectedchannel, discord.TextChannel)
+    self.selection = selectedchannel
     self.update_list()
     guildchannels = get_guildchannels(self.parent.config, self.selection.guild.id)
     vetting = findvettingchannel(guildchannels)
     channeltype = guildchannels.get(
       self.selection.parent_id if isinstance(self.selection, discord.Thread) else self.selection.id
     )
+    assert channeltype is not None
     await inter.response.edit_message(
       content=self.parent.babel(
         inter, 'channelprompted', channel=self.selection.mention,
-        vetting=vetting and 'feedback' not in channeltype.name
+        vetting=bool(vetting and 'feedback' not in channeltype.name)
       ),
       view=self)
 
   @discord.ui.button(
     disabled=False, style=discord.ButtonStyle.primary, emoji='📨', custom_id='confessionchannel_send'
   )
-  async def send_button(self, inter:discord.Interaction, _:discord.Button):
+  async def send_button(self, inter:discord.Interaction, _:discord.ui.Button):
     """ Send the confession """
     if self.selection is None or self.done:
-      self.disable(inter)
+      await self.disable(inter)
       return
 
     if self.confession is None:
+      assert isinstance(self.origin, discord.Message)
       self.confession = ConfessionData(self.parent)
       self.confession.create(author=inter.user, target=self.selection)
       self.confession.set_content(self.origin.content)
@@ -317,9 +346,8 @@ class ChannelSelectView(discord.ui.View):
       self.confession.create(author=inter.user, target=self.selection)
 
     if vetting := await self.confession.check_vetting(inter):
-      await self.parent.bot.cogs['ConfessionsModeration'].send_vetting(
-        inter, self.confession, vetting
-      )
+      modcog = cast("ConfessionsModeration", self.parent.bot.cogs['ConfessionsModeration'])
+      await modcog.send_vetting(inter, self.confession, vetting)
       await inter.delete_original_response()
       return
     if vetting is False:
@@ -339,9 +367,9 @@ class ChannelSelectView(discord.ui.View):
 
   def change_page(self, pagediff:int):
     """ Add or remove pagediff to self.page and trigger on_page_change event """
-    async def action(inter):
+    async def action(interaction):
       self.page += pagediff
-      await self.on_page_change(inter)
+      await self.on_page_change(interaction)
     return action
 
   async def on_page_change(self, inter:discord.Interaction):
@@ -365,7 +393,7 @@ class ChannelSelectView(discord.ui.View):
     await inter.response.edit_message(
       content=(
         self.parent.babel(inter, 'channelprompt') + ' ' +
-        self.parent.babel(inter, 'channelprompt_pager', page=self.page + 1)
+        self.parent.babel(inter, 'channelprompt_pager', page=str(self.page + 1))
       ),
       view=self
     )
@@ -377,12 +405,17 @@ class ChannelSelectView(discord.ui.View):
     self.send_button.disabled = True
     self.done = True
     if inter.response.is_done():
+      assert inter.message is not None
       await inter.message.edit(view=self)
     else:
       await inter.response.edit_message(view=self)
 
   async def on_timeout(self):
-    originuser = (self.origin.author if isinstance(self.origin,discord.Message) else self.origin.user)
+    if isinstance(self.origin, discord.Message):
+      originuser = self.origin.author
+    else:
+      assert isinstance(self.origin, discord.Interaction)
+      originuser = self.origin.user
     try:
       if isinstance(self.origin, discord.Interaction):
         if not self.done:
@@ -413,16 +446,10 @@ class ChannelSelectView(discord.ui.View):
 
 class Crypto:
   """ Handles encryption and decryption of sensitive data """
-  _key = None
+  _key: bytes
   NONCE_LEN = 16 # 128 bits
 
-  @property
-  def key(self) -> str:
-    """ Key getter """
-    return self._key
-
-  @key.setter
-  def key(self, value:str):
+  def setkey(self, value:str):
     """ Key setter """
     self._key = b64decode(value)
 
@@ -435,7 +462,7 @@ class Crypto:
     return secrets.token_bytes(length)
 
   def hash(self, data:bytes, salt:bytes) -> bytes:
-    hash = SHA.new(data + salt)
+    hash = hashlib.sha1(data + salt)
     return hash.digest()
 
   def encrypt(self, data:bytes) -> bytes:
@@ -458,7 +485,7 @@ class Crypto:
     return rawdata
 
 
-referenced_message_cache:OrderedDict[int, discord.Message] = {}
+referenced_message_cache:OrderedDict[int, discord.Message | discord.PartialMessage] = OrderedDict()
 
 
 class ConfessionData:
@@ -466,7 +493,7 @@ class ConfessionData:
   SCOPE = 'confessions' # exists to keep babel happy
   DATA_VERSION = 2
   anonid:str | None
-  author:discord.User
+  author:discord.Member
   target:Confessable
   channeltype_flags:int = 0
   content:str | None = None
@@ -477,7 +504,7 @@ class ConfessionData:
   channeltype:ChannelType
   targetchanneltype:ChannelType
 
-  def __init__(self, parent:Union[Confessions, ConfessionsModeration]):
+  def __init__(self, parent:ConfessionCog):
     """ Creates a ConfessionData class, from here, either use from_binary() or create() """
     # Aliases to shorten code
     self.parent = parent
@@ -503,8 +530,10 @@ class ConfessionData:
       reference_id = int.from_bytes(binary[18:26], 'big')
     else:
       raise CorruptConfessionDataException("Data format incorrect;", len(binary), "!=", 26)
-    self.author = await self.bot.fetch_user(author_id)
-    self.target = await self.bot.fetch_channel(targetchannel_id)
+    targetchannel = await self.bot.fetch_channel(targetchannel_id)
+    assert isinstance(targetchannel, discord.TextChannel)
+    self.author = await targetchannel.guild.fetch_member(author_id)
+    self.target = targetchannel
     self.anonid = self.get_anonid(self.target.guild.id, self.author.id)
     guildchannels = get_guildchannels(self.config, self.target.guild.id)
     self.channeltype = guildchannels.get(
@@ -519,26 +548,30 @@ class ConfessionData:
   def create(
     self,
     *,
-    author:discord.User | None = None,
-    target:Confessable | None = None,
-    reference:discord.Message | None = None
+    author:discord.abc.User,
+    target:Confessable,
+    reference:discord.Message | discord.PartialMessage | None = None
   ):
-    if (author and not target) or (target and not author):
-      raise Exception("Both author and targetchannel must be provided at the same time")
-    if author:
-      if hasattr(self, 'author') and self.author != author:
-        raise Exception("Attempted to change confession author from", self.author, "to", author, "!")
+    """ Creates a pending confession from user and target data """
+    if hasattr(self, 'author') and self.author != author:
+      raise Exception("Attempted to change confession author from", self.author, "to", author, "!")
+    if isinstance(author, discord.User):
+      member = target.guild.get_member(author.id)
+      assert member is not None
+      self.author = member
+    else:
+      assert isinstance(author, discord.Member)
       self.author = author
-      self.target = target
-      self.anonid = self.get_anonid(target.guild.id, author.id)
-      guildchannels = get_guildchannels(self.config, target.guild.id)
-      self.channeltype = guildchannels.get(
-        target.parent_id if isinstance(target, discord.Thread) else target.id,
-        ChannelType.unset
-      )
-      self.targetchanneltype = self.channeltype
+    self.target = target
+    self.anonid = self.get_anonid(target.guild.id, author.id)
     if reference:
       self.reference = reference
+    guildchannels = get_guildchannels(self.config, target.guild.id)
+    self.channeltype = guildchannels.get(
+      target.parent_id if isinstance(target, discord.Thread) else target.id,
+      ChannelType.unset
+    )
+    self.targetchanneltype = self.channeltype
 
   def set_content(self, content:Optional[str] = '', *, embed:Optional[discord.Embed] = None):
     self.content = content
@@ -556,7 +589,9 @@ class ConfessionData:
   async def add_image(self, *, attachment:discord.Attachment | None = None, url:str | None = None):
     """ Download image so it can be reuploaded with message """
     async with aiohttp.ClientSession() as session:
-      async with session.get(attachment.url if attachment else url) as res:
+      targeturl = attachment.url if attachment else url
+      assert targeturl is not None
+      async with session.get(targeturl) as res:
         if res.status == 200:
           filename = 'file.'+res.content_type.replace('image/','')
           self.file = discord.File(
@@ -612,6 +647,7 @@ class ConfessionData:
     if self.embed is None:
       self.embed = discord.Embed(description=self.content)
     if self.channeltype.anonid:
+      assert self.anonid is not None
       self.embed.colour = discord.Colour(int(self.anonid,16))
       self.embed.set_author(name=f'Anon-{self.anonid}')
     else:
@@ -633,24 +669,37 @@ class ConfessionData:
     """ Only allow images to be sent if imagesupport is enabled and the image is valid """
     image = self.attachment
     guild_id = self.target.guild.id
-    if image and image.content_type.startswith('image') and image.size < 25_000_000:
-      # Discord size limit
-      if bool(self.config.get(f"{guild_id}_imagesupport", fallback=True)):
-        return True
-      return False
+    if image:
+      assert image.content_type is not None
+      if image.content_type.startswith('image') and image.size < self.target.guild.filesize_limit:
+        # Discord size limit
+        if bool(self.config.get(f"{guild_id}_imagesupport", fallback=True)):
+          return True
+        return False
     raise commands.BadArgument()
 
   def check_spam(self):
     """ Verify message doesn't contain spam as defined in [confessions] spam_flags """
-    for spamflag in self.config.get('spam_flags', fallback=None).splitlines():
+    for spamflag in self.config.get('spam_flags', fallback='').splitlines():
       if self.content and re.match(spamflag, self.content):
+        return False
+    return True
+
+  def check_badwords(self, inter:discord.Interaction):
+    """ Verify message doesn't contain spam as defined in [confessions] spam_flags """
+    key = f'{inter.guild_id}_badwords'
+    badwords = self.config.get(key, fallback='')
+    if len(badwords) == 0:
+      return True
+    for badword in badwords.split(','):
+      if self.content and badword.strip().lower() in self.content.lower():
         return False
     return True
 
   async def check_vetting(
     self,
     inter:discord.Interaction,
-  ) -> discord.TextChannel | bool | None:
+  ) -> discord.TextChannel | Literal[False] | None:
     """ Check if vetting is required, this is not a part of check_all """
     send = (inter.followup.send if inter.response.is_done() else inter.response.send_message)
     guildchannels = get_guildchannels(self.config, self.target.guild.id)
@@ -659,7 +708,9 @@ class ConfessionData:
       if 'ConfessionsModeration' not in self.bot.cogs:
         await send(self.babel(inter, 'no_moderation'), ephemeral=True)
         return False
-      return self.target.guild.get_channel(vetting)
+      vettingchannel = self.target.guild.get_channel(vetting)
+      assert isinstance(vettingchannel, discord.TextChannel)
+      return vettingchannel
     return None
 
   async def check_all(self, inter:discord.Interaction) -> bool:
@@ -668,7 +719,7 @@ class ConfessionData:
       In the event that a check fails, return the relevant babel key
     """
     send = (inter.followup.send if inter.response.is_done() else inter.response.send_message)
-    kwargs = {'ephemeral':True}
+    kwargs: dict[str, Any] = {'ephemeral':True}
 
     if (
       self.targetchanneltype in get_channeltypes(self.bot.cogs)
@@ -690,6 +741,10 @@ class ConfessionData:
 
     if not self.check_banned():
       await send(self.babel(inter, 'nosendbanned'), **kwargs)
+      return False
+
+    if not self.check_badwords(inter):
+      await send(self.babel(inter, 'nobadword'), **kwargs)
       return False
 
     if self.attachment:
@@ -715,7 +770,7 @@ class ConfessionData:
     Adds copious amounts of error handling
     """
     send = (inter.followup.send if inter.response.is_done() else inter.response.send_message)
-    kwargs = {'ephemeral':True}
+    kwargs: dict[str, Any] = {'ephemeral':True}
     try:
       await func
       return True
@@ -784,9 +839,10 @@ class ConfessionData:
         if dep not in self.bot.cogs:
           await inter.followup.send(self.babel(inter, 'vet_error_module', module=dep), ephemeral=True)
           return False
-        special_function = getattr(self.bot.cogs[dep], 'on_channeltype_send', None)
-        if callable(special_function):
-          result = await special_function(inter, self)
+        cog = cast(ConfessionCog, self.bot.cogs[dep])
+        result = await cog.on_channeltype_send(inter, self)
+        # If the method is stubbed, will return None
+        if result is not None:
           if result is False:
             return False
           if 'use_webhook' in result:
@@ -820,18 +876,25 @@ class ConfessionData:
           (preface + ' - ' if preface and not mentions_in_preface else '') +
           (f'[Anon-{self.anonid}]' if self.channeltype.anonid else '[Anon]')
         )
-        pfp = (
-          self.config.get('pfpgen_url', '')
-          .replace('{}', self.anonid if self.channeltype.anonid else botcolour)
+        if self.channeltype.anonid:
+          assert self.anonid is not None
+          colour = self.anonid
+        else:
+          colour = botcolour
+        pfp = self.config.get('pfpgen_url', '').replace('{}', colour)
+        content = (
+          ('> ' + preface + '\n' if mentions_in_preface else '') +
+          (self.content if self.content else '')
         )
-        content = ('> ' + preface + '\n' if mentions_in_preface else '') + self.content
         func = webhook.send(content, username=username, avatar_url=pfp, **kwargs)
         #TODO: add support for custom PFPs
       else:
         return False
     else:
       self.generate_embed()
-      func = target.send(preface, embed=self.embed, **kwargs)
+      if self.embed:
+        kwargs['embed'] = self.embed
+      func = target.send(preface, **kwargs)
     success = await self.handle_send_errors(inter, func)
 
     if 'Log' in self.bot.cogs and target == self.target:
@@ -839,7 +902,8 @@ class ConfessionData:
         f'{self.target.guild.name}/{self.anonid} ({self.author.name}): ' +
         self.bot.utilities.truncate(self.content) + (' (attachment)' if self.file else '')
       )
-      await self.bot.cogs['Log'].log_misc_str(content=logentry)
+      logcog = cast("Log", self.bot.cogs['Log'])
+      await logcog.log_misc_str(logentry)
 
     # Mark the command as complete by sending a success message
     if success and success_message:
@@ -856,6 +920,7 @@ class ConfessionData:
     """ Tries to find a webhook, or create it, or complain about missing permissions """
     webhook:discord.Webhook
     channel = target.parent if isinstance(target, discord.Thread) else target
+    assert isinstance(channel, discord.TextChannel)
     try:
       for webhook in await channel.webhooks():
         if webhook.user == self.bot.user:
