@@ -81,6 +81,8 @@ class ConfessionsSetup(ConfessionCog, ControlPanelCog):
       # Find channel types in config
       assert inter.guild is not None
       matches = self.regenerate_matches(parent, inter.guild)
+      if not matches:
+        raise Exception("No channels found for setup list")
       super().__init__(inter, parent, matches)
       self.channel_selector.callback = self.channel_selector_override
       self.channel_selector.placeholder = self.parent.babel(inter, 'setup_placeholder')
@@ -227,11 +229,16 @@ class ConfessionsSetup(ConfessionCog, ControlPanelCog):
       self.help.disabled = True
       #BABEL: state_desc_#
       descmode = 'state_desc_' + str(self.current_mode.value)
-      await inter.response.edit_message(content=(
-        self.parent.babel(inter, 'setup_state', channel=self.current_channel.mention, state=modename)
-        + '\n' + self.parent.babel(inter, descmode)
-        + '\n' + self.parent.babel(inter, 'state_cta')
-      ), view=self)
+      try:
+        await inter.response.edit_message(content=(
+          self.parent.babel(
+            inter, 'setup_state', channel=self.current_channel.mention, state=modename
+          )
+          + '\n' + self.parent.babel(inter, descmode)
+          + '\n' + self.parent.babel(inter, 'state_cta')
+        ), view=self)
+      except discord.NotFound:
+        pass
 
     async def channel_selector_override(self, interaction:discord.Interaction):
       """ Update the message to preview the selected target """
@@ -397,9 +404,12 @@ class ConfessionsSetup(ConfessionCog, ControlPanelCog):
     assert inter.channel is not None
     channel = self.bot.get_channel(inter.channel.id)
     assert channel is not None and isinstance(channel, (discord.TextChannel, discord.Thread))
-    await inter.response.send_message(
-      self.babel(inter, 'setup_start'), view=self.SetupView(inter, self, channel), ephemeral=True
-    )
+    try:
+      await inter.response.send_message(
+        self.babel(inter, 'setup_start'), view=self.SetupView(inter, self, channel), ephemeral=True
+      )
+    except Exception:
+      await inter.response.send_message(self.babel(inter, 'setup_channel_missing'))
 
   @app_commands.command(
     name=app_commands.locale_str('shuffle', scope=SCOPE),

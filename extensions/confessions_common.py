@@ -217,7 +217,7 @@ async def safe_fetch_target(
     result = await parent.bot.fetch_channel(channel_id)
     assert isinstance(result, discord.TextChannel)
     return result
-  except discord.Forbidden | discord.HTTPException | discord.NotFound:
+  except discord.Forbidden | discord.NotFound:
     await inter.response.send_message(
       parent.babel(inter, 'missingchannelerr') + ' (fetch)',
       ephemeral=True
@@ -307,6 +307,8 @@ class ChannelSelectView(discord.ui.View):
       return
     self.send_button.disabled = False
     selectedchannel = self.parent.bot.get_channel(int(this.values[0]))
+    if isinstance(selectedchannel, discord.Thread):
+      selectedchannel = selectedchannel.parent
     assert isinstance(selectedchannel, discord.TextChannel)
     self.selection = selectedchannel
     self.update_list()

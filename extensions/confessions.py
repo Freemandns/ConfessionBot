@@ -197,7 +197,10 @@ class Confessions(ConfessionCog):
     guildchannels = get_guildchannels(self.config, member.guild.id)
     for channel in member.guild.channels:
       if channel.id in guildchannels:
-        assert isinstance(channel, discord.TextChannel)
+        if not isinstance(channel, discord.TextChannel):
+          print("EXCEPTION: Set channel in guild is not a TextChannel;", channel)
+          #TODO: watch for log entries
+          continue
         channeltype = guildchannels[channel.id]
         if channeltype == ChannelType.vetting:
           vetting = True
@@ -517,7 +520,7 @@ class Confessions(ConfessionCog):
       #BABEL: listtitlelocal,listtitle
       await inter.response.send_message((
         self.babel(inter, 'listtitlelocal' if local else 'listtitle') + '\n' +
-        self.generate_list(inter.user, matches, vetting) +
+        self.bot.utilities.truncate(self.generate_list(inter.user, matches, vetting), 1600) +
         (
           # Hint on how to confess to a feedback channel
           '\n\n' + self.babel(inter, 'confess_to_feedback')
