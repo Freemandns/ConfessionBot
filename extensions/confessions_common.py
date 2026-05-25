@@ -215,14 +215,14 @@ async def safe_fetch_target(
   """ Gracefully handles whenever a confession target isn't available """
   try:
     result = await parent.bot.fetch_channel(channel_id)
-    assert isinstance(result, discord.TextChannel)
-    return result
-  except discord.Forbidden | discord.HTTPException | discord.NotFound:
+    if isinstance(result, (discord.TextChannel, discord.Thread)):
+      return result
+  except (discord.Forbidden, discord.NotFound, discord.HTTPException):
     await inter.response.send_message(
       parent.babel(inter, 'missingchannelerr') + ' (fetch)',
       ephemeral=True
     )
-    return None
+  return None
 
 
 # Exceptions
@@ -307,6 +307,8 @@ class ChannelSelectView(discord.ui.View):
       return
     self.send_button.disabled = False
     selectedchannel = self.parent.bot.get_channel(int(this.values[0]))
+    if isinstance(selectedchannel, discord.Thread):
+      selectedchannel = selectedchannel.parent
     assert isinstance(selectedchannel, discord.TextChannel)
     self.selection = selectedchannel
     self.update_list()
